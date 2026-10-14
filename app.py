@@ -1,7 +1,7 @@
 import calendar, datetime as dt
 import numpy as np, pandas as pd, streamlit as st, plotly.graph_objects as go
 from scipy.stats import norm
-from scipy.optimize import differential_evolution
+from scipy.optimize import minimize
 
 st.set_page_config(page_title="Monthly Asian Option Strip Solver", layout="wide")
 
@@ -65,23 +65,20 @@ n_months = sb.slider("Number of months in strip", 1, 12, 3)
 first_month = add_months(today, sb.slider("First expiry month (months ahead)", 1, 12, 1))
 start_mode = sb.selectbox("Averaging start", ["Start of expiry month", "Today", "Tomorrow", "In X days"])
 days0 = sb.number_input("Days from today (if 'In X days')", 0, 365, 30)
-sb.caption("Each month has its own forward price and volatility, entered in the table below.")
 
 sb.header("Physical exposure")
 phys_vol = sb.number_input("Physical volume per month (same unit)", value=1000.0, min_value=0.0, step=100.0)
 phys_ref = sb.number_input("Physical reference / budget price", value=100.0, min_value=0.0001, step=0.01, format="%.4f")
 
 sb.header("Solver targets")
-hedge_pct = sb.slider("Starting hedge ratio (% of physical volume)", 0, 200, 100, 5)/100
 max_spend = sb.number_input("Max total premium spend", value=50000.0, min_value=0.0, step=1000.0)
 max_loss = sb.number_input("Max total loss (worst-case net P&L)", value=-100000.0, step=10000.0)
-sb.caption("Strikes are fixed at your chosen offsets. The solver finds the hedge ratio that best meets both targets "
-           "(minimum constraint violation; if feasible, minimum spend).")
+sb.caption("Solver variables: hedge ratio, short put strike %, long put strike %. "
+           "Call strikes fixed at your minimums. Minimises premium spend; if infeasible, returns closest solution plus what must change.")
 
 # ---------------------------------------------------------------- monthly inputs
 st.title("Monthly Asian Option Strip – 4-Way Solver")
 st.subheader("1) Monthly market inputs (forward price and vol per month)")
-st.caption("Edit the Forward and Vol % columns directly for each month. Dates can also be overridden per month.")
 mrows = []
 for i in range(n_months):
     fm = add_months(first_month, i)
@@ -89,23 +86,23 @@ for i in range(n_months):
                   "Start": fm.strftime("%Y-%m-%d"), "Expiry": last_bday(fm).strftime("%Y-%m-%d")})
 months = st.data_editor(pd.DataFrame(mrows), num_rows="fixed", use_container_width=True,
     column_config={"Month": st.column_config.TextColumn(disabled=True),
-                   "Forward": st.column_config.NumberColumn(min_value=0.0001, format="%.4f",
-                       help="Forward underlying price for this month's average"),
-                   "Vol %": st.column_config.NumberColumn(min_value=0.1, format="%.2f",
-                       help="Volatility of the underlying for this month"),
+                   "Forward": st.column_config.NumberColumn(min_value=0.0001, format="%.4f"),
+                   "Vol %": st.column_config.NumberColumn(min_value=0.1, format="%.2f"),
                    "Start": st.column_config.TextColumn(help="Averaging start date (YYYY-MM-DD)"),
                    "Expiry": st.column_config.TextColumn(help="Final fixing / expiry date (YYYY-MM-DD)")})
 
-st.subheader("2) 4-way strike offsets (% of that month's forward) – fixed by you")
-c = st.columns(4)
-k1p = c[0].number_input("Long call strike %", value=100.0, min_value=1.0)
-k2p = c[1].number_input("Short call strike %", value=120.0, min_value=1.0)
-k3p = c[2].number_input("Short put strike %", value=90.0, min_value=1.0)
-k4p = c[3].number_input("Long put strike %", value=80.0, min_value=1.0)
-if not (k4p < k3p < k1p < k2p):
-    st.warning("Expected ordering: long put % < short put % < long call % < short call %.")
+st.subheader("2) Call strike minimums (% of that month's forward) – fixed by you")
+c = st.columns(2)
+k1p = c[0].number_input("Long call strike % (minimum)", value=100.0, min_value=1.0)
+k2p = c[1].number_input("Short call strike % (minimum)", value=110.0, min_value=1.0)
+if k2p <= k1p:
+    st.warning("Short call strike % should be above long call strike %.")
+k3_lo = st.sidebar.number_input("Short put strike % – lower bound", value=70.0, min_value=1.0)
+k3_hi = st.sidebar.number_input("Short put strike % – upper bound", value=100.0, min_value=1.0)
+k4_lo = st.sidebar.number_input("Long put strike % – lower bound", value=50.0, min_value=1.0)
+h_lo, h_hi = 0.0, 3.0
 
-# ---------------------------------------------------------------- build per-month data
+# ---------------------------------------------------------------- per-month precompute
 md = []
 for _, row in months.iterrows():
     fm = dt.datetime.strptime(row["Month"], "%b %Y").date()
@@ -113,83 +110,130 @@ for _, row in months.iterrows():
     exp = dt.datetime.strptime(row["Expiry"], "%Y-%m-%d").date()
     fx = bdays(start, exp); tf = np.array([max((d - today).days, 0)/365.0 for d in fx])
     Tx = max(tf[-1], 1/365)
-    md.append({"label": row["Month"], "F": float(row["Forward"]), "vol": float(row["Vol %"])/100,
-               "fx": fx, "tf": tf, "T": Tx,
-               "K": [row["Forward"]*k1p/100, row["Forward"]*k2p/100, row["Forward"]*k3p/100, row["Forward"]*k4p/100]})
+    F = float(row["Forward"]); v = float(row["Vol %"])/100
+    md.append({"label": row["Month"], "F": F, "vol": v, "tf": tf, "T": Tx,
+               "call_prem": (asian_price("Call", F, F*k1p/100, Tx, v, r, tf)
+                             - asian_price("Call", F, F*k2p/100, Tx, v, r, tf))})
 
-def month_cost(m, h):
-    F, v, K = m["F"], m["vol"], m["K"]
-    legs = [(1,"Call",K[0]),(-1,"Call",K[1]),(-1,"Put",K[2]),(1,"Put",K[3])]
-    return sum(s*asian_price(k, F, kk, m["T"], v, r, m["tf"])*h*phys_vol*mult for s,k,kk in legs)
+pct = np.linspace(-50, 90, 300)
 
-def month_pnl(m, h, A):
-    F, K = m["F"], m["K"]
-    legs = [(1,"Call",K[0]),(-1,"Call",K[1]),(-1,"Put",K[2]),(1,"Put",K[3])]
-    p = sum(s*intrinsic(k, A, kk)*h*phys_vol*mult for s,k,kk in legs)
-    return p - month_cost(m, h)
+def strip_results(h, k3p, k4p):
+    q = h*phys_vol*mult
+    cost, net = 0.0, np.zeros_like(pct)
+    for m in md:
+        F, v, T, tf = m["F"], m["vol"], m["T"], m["tf"]
+        K3, K4 = F*k3p/100, F*k4p/100
+        prem = m["call_prem"] - asian_price("Put", F, K3, T, v, r, tf) + asian_price("Put", F, K4, T, v, r, tf)
+        cost += prem*q
+        A = F*(1+pct/100)
+        p = (np.maximum(A-F*k1p/100, 0) - np.maximum(A-F*k2p/100, 0)
+             - np.maximum(K3-A, 0) + np.maximum(K4-A, 0))
+        net += (p - prem)*q
+    return cost, net.min(), net
+
+def objective(x):
+    h, k3p, k4p = x
+    if k4p >= k3p: return 1e9
+    cost, worst, _ = strip_results(h, k3p, k4p)
+    v_s = max(0.0, cost - max_spend); v_l = max(0.0, max_loss - worst)
+    scale_s = max(abs(max_spend), 1.0); scale_l = max(abs(max_loss), 1.0)
+    viol = (v_s/scale_s)**2 + (v_l/scale_l)**2
+    return 1e6*viol + cost/scale_s if viol > 0 else cost/scale_s
 
 # ---------------------------------------------------------------- solver
 st.subheader("3) Solver")
-A_grid = np.linspace(0.3*min(m["F"] for m in md), 1.9*max(m["F"] for m in md), 800)
-def evaluate(h):
-    cost = sum(month_cost(m, h) for m in md)
-    net = np.zeros_like(A_grid)
-    for m in md:
-        net += month_pnl(m, h, A_grid)
-    return cost, net.min(), net
-
-def objective(h):
-    cost, worst, _ = evaluate(h)
-    v_spend = max(0.0, cost - max_spend)
-    v_loss = max(0.0, max_loss - worst)
-    # normalise violations by target scale so both constraints matter
-    scale_s = max(abs(max_spend), 1.0); scale_l = max(abs(max_loss), 1.0)
-    viol = (v_spend/scale_s)**2 + (v_loss/scale_l)**2
-    if viol > 0:
-        return 1e6*viol + cost/scale_s  # nearest feasible: minimise violation, tie-break on cost
-    return cost/scale_s  # feasible: minimise spend
-
 if st.button("Solve 4-way strip", type="primary"):
-    res = differential_evolution(objective, bounds=[(0.0, 3.0)], seed=1, tol=1e-8, polish=True)
-    h = float(res.x[0]); cost, worst, net = evaluate(h)
-    st.session_state["sol"] = (h, cost, worst, net)
-h_sol = st.session_state.get("sol")
-if h_sol:
-    h, cost, worst, net = h_sol
+    best = None
+    for h0 in (0.5, 1.0, 1.5, 2.0):
+        for k30 in (k3_lo+5, (k3_lo+k3_hi)/2, k3_hi-5):
+            for k40 in (k4_lo, k4_lo+10):
+                if k40 >= k30: continue
+                res = minimize(objective, x0=[h0, k30, k40], method="Nelder-Mead",
+                               bounds=[(h_lo, h_hi), (k3_lo, k3_hi), (k4_lo, k3_hi-0.5)],
+                               options={"maxiter": 400, "xatol": 1e-3, "fatol": 1e-6})
+                if best is None or res.fun < best.fun: best = res
+    h, k3p, k4p = [float(v) for v in best.x]
+    k4p = min(k4p, k3p - 0.5)
+    cost, worst, net = strip_results(h, k3p, k4p)
+    st.session_state["sol"] = (h, k3p, k4p, cost, worst, net)
+
+sol = st.session_state.get("sol")
+if sol:
+    h, k3p, k4p, cost, worst, net = sol
     feas = cost <= max_spend and worst >= max_loss
     m = st.columns(5)
     m[0].metric("Solved hedge ratio", f"{h:.0%} of physical")
-    m[1].metric("Total premium spend", f"{cost:,.0f} {ccy}")
-    m[2].metric("Worst-case net P&L", f"{worst:,.0f} {ccy}")
-    m[3].metric("Max spend target", f"{max_spend:,.0f} {ccy}", delta=f"{cost-max_spend:,.0f}", delta_color="inverse")
-    m[4].metric("Max loss target", f"{max_loss:,.0f} {ccy}", delta=f"{worst-max_loss:,.0f}", delta_color="normal")
+    m[1].metric("Short put strike", f"{k3p:.1f}% of fwd")
+    m[2].metric("Long put strike", f"{k4p:.1f}% of fwd")
+    m[3].metric("Total premium spend", f"{cost:,.0f} {ccy}", delta=f"{cost-max_spend:,.0f} vs target", delta_color="inverse")
+    m[4].metric("Worst-case net P&L", f"{worst:,.0f} {ccy}", delta=f"{worst-max_loss:,.0f} vs target")
     if feas:
-        st.success("Both targets met. This is the lowest-spend hedge ratio that satisfies them.")
+        st.success(f"Both targets met: hedge {h:.0%}, short put {k3p:.1f}%, long put {k4p:.1f}%. Lowest-spend solution found.")
     else:
-        st.warning("No hedge ratio meets both targets with these strikes. This is the closest solution: "
-                   f"spend over by {max(0,cost-max_spend):,.0f}, loss over by {max(0,max_loss-worst):,.0f}. "
-                   "Widen the strikes or relax a target.")
+        st.warning(f"No solution meets both targets with the current call strikes and put bounds. Closest: "
+                   f"spend over by {max(0,cost-max_spend):,.0f}, loss over by {max(0,max_loss-worst):,.0f}.")
+        # ---- diagnostics: what must change ----
+        st.subheader("What must change to get a solution")
+        hs = np.linspace(0.05, 3.0, 40)
+        k3s = np.linspace(k3_lo, k3_hi-1.0, 8)
+        k4s = np.linspace(k4_lo, k3_hi-2.0, 8)
+        min_cost_given_loss, best_wc_given_spend = np.inf, -np.inf
+        arg_cost = arg_wc = None
+        for k3 in k3s:
+            for k4 in k4s:
+                if k4 >= k3: continue
+                for hh in hs:
+                    cst, wc, _ = strip_results(hh, k3, k4)
+                    if wc >= max_loss and cst < min_cost_given_loss:
+                        min_cost_given_loss, arg_cost = cst, (hh, k3, k4)
+                    if cst <= max_spend and wc > best_wc_given_spend:
+                        best_wc_given_spend, arg_wc = wc, (hh, k3, k4)
+        d = st.columns(3)
+        if np.isfinite(min_cost_given_loss):
+            d[0].metric("Min spend meeting loss target", f"{min_cost_given_loss:,.0f} {ccy}")
+            st.caption(f"Achieved at hedge {arg_cost[0]:.0%}, short put {arg_cost[1]:.1f}%, long put {arg_cost[2]:.1f}%. "
+                       f"Raise max spend to at least {min_cost_given_loss:,.0f} (currently {max_spend:,.0f}).")
+        else:
+            d[0].metric("Min spend meeting loss target", "Not achievable")
+            st.caption("Even the widest allowed put strikes cannot meet the loss target at any hedge ratio. "
+                       "Raise the short-put upper bound or relax the loss target.")
+        if best_wc_given_spend > -np.inf:
+            d[1].metric("Best loss meeting spend target", f"{best_wc_given_spend:,.0f} {ccy}")
+            st.caption(f"Achieved at hedge {arg_wc[0]:.0%}, short put {arg_wc[1]:.1f}%, long put {arg_wc[2]:.1f}%. "
+                       f"Relax max loss to at least {best_wc_given_spend:,.0f} (currently {max_loss:,.0f}).")
+        else:
+            d[1].metric("Best loss meeting spend target", "Not achievable")
+            st.caption("Even the cheapest structure exceeds the spend target at every hedge ratio. "
+                       "Raise max spend or lower the long-call strike minimum.")
+        d[2].metric("Both targets", "See notes")
+        st.caption("To meet both: either raise max spend to the first figure, or relax max loss to the second, "
+                   "or widen the put strike bounds and re-solve.")
 else:
-    h, cost, worst, net = hedge_pct, sum(month_cost(m, hedge_pct) for m in md), None, None
-    st.info("Set targets and press 'Solve 4-way strip'. The charts below currently use the slider hedge ratio.")
+    h, k3p, k4p = 1.0, 90.0, 80.0
+    cost, worst, net = strip_results(h, k3p, k4p)
+    st.info("Press 'Solve 4-way strip'. Charts below show an illustrative 100% hedge, 90%/80% puts.")
 
 # ---------------------------------------------------------------- charts
 st.subheader("4) Resulting charts")
 fig1 = go.Figure()
 for m in md:
-    A = np.linspace(m["F"]*0.5, m["F"]*1.5, 400)
-    p = month_pnl(m, h, A)
-    fig1.add_trace(go.Scatter(x=A, y=p, mode="lines", name=m["label"]))
+    F = m["F"]; K3, K4 = F*k3p/100, F*k4p/100
+    A = F*(1+pct/100)
+    prem = m["call_prem"] - asian_price("Put", F, K3, m["T"], m["vol"], r, m["tf"]) + asian_price("Put", F, K4, m["T"], m["vol"], r, m["tf"])
+    p = (np.maximum(A-F*k1p/100, 0) - np.maximum(A-F*k2p/100, 0) - np.maximum(K3-A, 0) + np.maximum(K4-A, 0))
+    fig1.add_trace(go.Scatter(x=A, y=(p-prem)*h*phys_vol*mult, mode="lines", name=m["label"]))
 fig1.add_hline(y=0, line_color="black")
 fig1.update_layout(title="Per-month 4-way P&L vs that month's average price",
                    xaxis_title="Average price", yaxis_title=f"P&L ({ccy})", height=450, hovermode="x unified")
 st.plotly_chart(fig1, use_container_width=True)
 
-pct = np.linspace(-50, 90, 500)
 agg = np.zeros_like(pct)
 for m in md:
-    A = m["F"]*(1+pct/100)
-    agg += month_pnl(m, h, A)
+    F = m["F"]; K3, K4 = F*k3p/100, F*k4p/100
+    A = F*(1+pct/100)
+    prem = m["call_prem"] - asian_price("Put", F, K3, m["T"], m["vol"], r, m["tf"]) + asian_price("Put", F, K4, m["T"], m["vol"], r, m["tf"])
+    p = (np.maximum(A-F*k1p/100, 0) - np.maximum(A-F*k2p/100, 0) - np.maximum(K3-A, 0) + np.maximum(K4-A, 0))
+    agg += (p-prem)*h*phys_vol*mult
 xs, ys = segments(1+pct/100, agg)
 fig2 = go.Figure()
 red_green(fig2, xs, ys, lw=4)
@@ -212,15 +256,18 @@ fig3.update_layout(title="Net P&L: physical + option strip (buyer of fuel)",
                    xaxis_title="Price move vs forward (%)", yaxis_title=f"P&L ({ccy})", height=500, hovermode="x unified")
 st.plotly_chart(fig3, use_container_width=True)
 
-st.subheader("5) Structure per month")
+st.subheader("5) Solved structure per month")
 srows = []
 for m in md:
-    K = m["K"]; c0 = month_cost(m, h)
-    srows.append({"Month": m["label"], "Forward": m["F"], "Vol %": m["vol"]*100,
-                  "Long call K": K[0], "Short call K": K[1], "Short put K": K[2], "Long put K": K[3],
-                  "Volume": h*phys_vol, "Net premium": c0})
+    F = m["F"]; q = h*phys_vol*mult
+    K3, K4 = F*k3p/100, F*k4p/100
+    prem = m["call_prem"] - asian_price("Put", F, K3, m["T"], m["vol"], r, m["tf"]) + asian_price("Put", F, K4, m["T"], m["vol"], r, m["tf"])
+    srows.append({"Month": m["label"], "Forward": F, "Vol %": m["vol"]*100,
+                  "Long call K": F*k1p/100, "Short call K": F*k2p/100,
+                  "Short put K": K3, "Long put K": K4, "Volume": q, "Net premium": prem*q})
 st.dataframe(pd.DataFrame(srows).style.format({"Forward": "{:,.2f}", "Vol %": "{:,.1f}", "Long call K": "{:,.2f}",
              "Short call K": "{:,.2f}", "Short put K": "{:,.2f}", "Long put K": "{:,.2f}",
              "Volume": "{:,.0f}", "Net premium": "{:,.0f}"}), use_container_width=True)
 st.caption("Arithmetic daily-average options, flat forward curve per month, per-month vol, moment-matched lognormal pricing. "
-           "Strikes fixed at user offsets; solver finds hedge ratio closest to meeting spend and loss targets.")
+           "Solver chooses hedge ratio and both put strikes; call strikes fixed at your minimums. "
+           "If infeasible, diagnostics show the minimum spend or loss relaxation needed.")
