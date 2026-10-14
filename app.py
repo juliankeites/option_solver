@@ -1,15 +1,11 @@
 import calendar, datetime as dt
 import numpy as np, pandas as pd, streamlit as st, plotly.graph_objects as go
 from scipy.stats import norm
+from scipy.optimize import differential_evolution
 
-st.set_page_config(page_title="Asian Option Strategy Payoff", layout="wide")
+st.set_page_config(page_title="Monthly Asian Option Strip Solver", layout="wide")
 
-PRESETS = {"Jet fuel (USD/t)": 800.0, "Jet fuel (USD/bbl)": 105.0, "Brent (USD/bbl)": 85.0,
-           "ICE Gasoil (USD/t)": 750.0, "EUR/USD": 1.08, "GBP/USD": 1.30, "Custom": 100.0}
-
-# ---------------------------------------------------------------- pricing
-def fixing_dates(start, expiry):
-    """Business days from start date to expiry (last fixing), inclusive."""
+def bdays(start, expiry):
     d, out = start, []
     while d <= expiry:
         if d.weekday() < 5: out.append(d)
@@ -17,8 +13,6 @@ def fixing_dates(start, expiry):
     return out or [expiry]
 
 def eff_vol(vol, t_fix, T):
-    """Moment-matched vol of the arithmetic average of a flat forward curve.
-    E[A]=F ; E[A^2]=F^2/N^2 * sum_ij exp(vol^2*min(ti,tj))."""
     t = np.asarray(t_fix, float)
     m2 = np.exp(vol**2*np.minimum.outer(t, t)).sum()/len(t)**2
     return np.sqrt(max(np.log(m2), 1e-12)/T)
@@ -44,10 +38,6 @@ def last_bday(first):
     while d.weekday() > 4: d -= dt.timedelta(days=1)
     return d
 
-def times_for(start, expiry, today):
-    fixes = fixing_dates(start, expiry)
-    return fixes, [max((d - today).days, 0)/365.0 for d in fixes]
-
 def segments(x, y):
     xs, ys = [x[0]], [y[0]]
     for i in range(1, len(x)):
@@ -56,182 +46,181 @@ def segments(x, y):
         xs.append(x[i]); ys.append(y[i])
     return np.array(xs), np.array(ys)
 
-def red_green(fig, xs, ys, lw=3, label=True):
+def red_green(fig, xs, ys, lw=3):
     fig.add_trace(go.Scatter(x=xs, y=np.where(ys >= 0, ys, 0), mode="lines", line=dict(width=0), fill="tozeroy",
                              fillcolor="rgba(0,160,0,0.35)", hoverinfo="skip", showlegend=False))
     fig.add_trace(go.Scatter(x=xs, y=np.where(ys <= 0, ys, 0), mode="lines", line=dict(width=0), fill="tozeroy",
                              fillcolor="rgba(220,0,0,0.35)", hoverinfo="skip", showlegend=False))
     for mask, col, nm in [(ys >= 0, "green", "Gain"), (ys <= 0, "red", "Loss")]:
-        fig.add_trace(go.Scatter(x=xs, y=np.where(mask, ys, np.nan), mode="lines", line=dict(color=col, width=lw),
-                                 name=nm, showlegend=label))
+        fig.add_trace(go.Scatter(x=xs, y=np.where(mask, ys, np.nan), mode="lines", line=dict(color=col, width=lw), name=nm))
 
 # ---------------------------------------------------------------- sidebar
 sb = st.sidebar
-sb.header("Market & expiry")
-name = sb.selectbox("1) Underlying", list(PRESETS))
-if name == "Custom":
-    name = sb.text_input("Custom name", "My underlying")
-spot = sb.number_input("Underlying / forward price", value=float(PRESETS.get(name, 100.0)), min_value=0.0001,
-                       step=0.01, format="%.4f", help="Flat forward curve: forward for every fixing date = this price.")
+sb.header("Global settings")
 today = dt.date.today()
-months = sb.slider("Months ahead (expiry month)", 1, 6, 3)
-first = add_months(today, months)
-last = dt.date(first.year, first.month, calendar.monthrange(first.year, first.month)[1])
-expiry = sb.date_input(f"Final fixing / expiry date ({first:%B %Y})", value=last_bday(first), min_value=first, max_value=last,
-                       help="Last averaging date. Set per product (gasoil, Brent, jet swaps differ).")
-
-sb.header("Averaging period")
-mode = sb.selectbox("Averaging start", ["Start of expiry month", "Today", "Tomorrow", "In X days", "Specific date"],
-                    help="Start can be anywhere between today and the expiry. A shorter window means a higher effective vol and a higher premium; "
-                         "a longer window (earlier start) is cheaper.")
-if mode == "Start of expiry month": start = first
-elif mode == "Today": start = today
-elif mode == "Tomorrow": start = today + dt.timedelta(days=1)
-elif mode == "In X days":
-    start = today + dt.timedelta(days=int(sb.number_input("Days from today", 0, max(1, (expiry - today).days), 30, step=1)))
-else:
-    start = sb.date_input("Averaging start date", value=first, min_value=today, max_value=expiry)
-start = min(start, expiry)
-fixes, t_fix = times_for(start, expiry, today)
-T = max(t_fix[-1], 1/365)
-sb.caption(f"{len(fixes)} daily fixings, {fixes[0]:%d %b %Y} to {fixes[-1]:%d %b %Y} | T(expiry) = {T:.3f} yrs")
-
-sb.header("Pricing inputs")
-vol_all = sb.number_input("Volatility for all strikes (%)", value=30.0, min_value=0.1, step=1.0,
-                          help="Flat, no skew. Applied to every leg; override per leg in the table. Underlying vol, not vol of the average.")
 r = sb.number_input("Risk-free rate (%)", value=4.0, step=0.25, min_value=-5.0)/100
-mult = sb.number_input("Contract size multiplier", value=1.0, min_value=0.0001, step=1.0)
 ccy = sb.text_input("Currency label", "USD")
+mult = sb.number_input("Contract size multiplier", value=1.0, min_value=0.0001, step=1.0)
+n_months = sb.slider("Number of months in strip", 1, 12, 3)
+first_month = add_months(today, sb.slider("First expiry month (months ahead)", 1, 12, 1))
+start_mode = sb.selectbox("Averaging start", ["Start of expiry month", "Today", "Tomorrow", "In X days"])
+days0 = sb.number_input("Days from today (if 'In X days')", 0, 365, 30)
+sb.caption("Each month has its own forward price and volatility, entered in the table below.")
 
 sb.header("Physical exposure")
-phys_side = sb.radio("Physical position", ["Buyer of fuel (cost rises with price)", "Seller / producer (revenue rises with price)", "None"])
-phys_vol = sb.number_input("Physical volume (same unit as underlying)", value=1000.0, min_value=0.0, step=100.0)
-phys_ref = sb.number_input("Physical reference / budget price", value=float(spot), min_value=0.0001, step=0.01, format="%.4f",
-                           help="Physical fuel is assumed priced at the same average price as the options.")
+phys_vol = sb.number_input("Physical volume per month (same unit)", value=1000.0, min_value=0.0, step=100.0)
+phys_ref = sb.number_input("Physical reference / budget price", value=100.0, min_value=0.0001, step=0.01, format="%.4f")
 
-# ---------------------------------------------------------------- legs
-st.title("Asian (Average Price) Option Strategy – P&L Payoff Diagram")
-st.subheader("2–3) Build legs")
-TEMPLATES = {
- "Custom": [("Long","Call",100),("Short","Call",115)],
- "Long call": [("Long","Call",100)],
- "Call spread (2-way)": [("Long","Call",100),("Short","Call",115)],
- "Zero-cost collar (2-way)": [("Long","Call",105),("Short","Put",95)],
- "Three-way (call spread + short put)": [("Long","Call",100),("Short","Call",120),("Short","Put",90)],
- "Four-way (call spread + put spread)": [("Long","Call",100),("Short","Call",120),("Short","Put",90),("Long","Put",80)],
-}
-tpl = st.selectbox("Strategy template (editable afterwards)", list(TEMPLATES), index=5)
-qty0 = st.number_input("Default quantity per leg", value=1000.0, min_value=0.0, step=100.0)
-t = TEMPLATES[tpl]
-n = int(st.number_input("Number of legs", 1, 8, len(t), key=f"n_{tpl}"))
-rows0 = [(d, ty, round(spot*k/100, 2), float(vol_all), float(qty0)) for d, ty, k in t]
-while len(rows0) < n: rows0.append(("Long", "Call", round(spot, 2), float(vol_all), float(qty0)))
-default = pd.DataFrame(rows0[:n], columns=["Direction","Type","Strike","Vol %","Qty"])
-legs = st.data_editor(
-    default, key=f"legs_{tpl}_{n}_{spot}_{qty0}_{vol_all}", num_rows="fixed", use_container_width=True,
-    column_config={"Direction": st.column_config.SelectboxColumn(options=["Long", "Short"]),
-                   "Type": st.column_config.SelectboxColumn(options=["Call", "Put"]),
-                   "Strike": st.column_config.NumberColumn(min_value=0.0001, format="%.4f"),
-                   "Vol %": st.column_config.NumberColumn(min_value=0.1, format="%.2f"),
-                   "Qty": st.column_config.NumberColumn(min_value=0.0, format="%.2f")})
+sb.header("Solver targets")
+hedge_pct = sb.slider("Starting hedge ratio (% of physical volume)", 0, 200, 100, 5)/100
+max_spend = sb.number_input("Max total premium spend", value=50000.0, min_value=0.0, step=1000.0)
+max_loss = sb.number_input("Max total loss (worst-case net P&L)", value=-100000.0, step=10000.0)
+sb.caption("Strikes are fixed at your chosen offsets. The solver finds the hedge ratio that best meets both targets "
+           "(minimum constraint violation; if feasible, minimum spend).")
 
-def strategy_cost(tf, Tx, asian=True):
-    c = 0.0
-    for _, l in legs.iterrows():
-        sign = 1 if l["Direction"] == "Long" else -1
-        v = l["Vol %"]/100
-        p = asian_price(l["Type"], spot, l["Strike"], Tx, v, r, tf) if asian else black76(l["Type"], spot, l["Strike"], Tx, v, r)
-        c += sign*p*l["Qty"]*mult
-    return c
+# ---------------------------------------------------------------- monthly inputs
+st.title("Monthly Asian Option Strip – 4-Way Solver")
+st.subheader("1) Monthly market inputs (forward price and vol per month)")
+st.caption("Edit the Forward and Vol % columns directly for each month. Dates can also be overridden per month.")
+mrows = []
+for i in range(n_months):
+    fm = add_months(first_month, i)
+    mrows.append({"Month": fm.strftime("%b %Y"), "Forward": 100.0, "Vol %": 30.0,
+                  "Start": fm.strftime("%Y-%m-%d"), "Expiry": last_bday(fm).strftime("%Y-%m-%d")})
+months = st.data_editor(pd.DataFrame(mrows), num_rows="fixed", use_container_width=True,
+    column_config={"Month": st.column_config.TextColumn(disabled=True),
+                   "Forward": st.column_config.NumberColumn(min_value=0.0001, format="%.4f",
+                       help="Forward underlying price for this month's average"),
+                   "Vol %": st.column_config.NumberColumn(min_value=0.1, format="%.2f",
+                       help="Volatility of the underlying for this month"),
+                   "Start": st.column_config.TextColumn(help="Averaging start date (YYYY-MM-DD)"),
+                   "Expiry": st.column_config.TextColumn(help="Final fixing / expiry date (YYYY-MM-DD)")})
 
-A_grid = np.linspace(spot*0.3, spot*1.9, 1200)
-rows, total_cost, payoff, call_net = [], 0.0, np.zeros_like(A_grid), 0.0
-for _, l in legs.iterrows():
-    sign = 1 if l["Direction"] == "Long" else -1
-    q = l["Qty"]*mult; v = l["Vol %"]/100
-    p = asian_price(l["Type"], spot, l["Strike"], T, v, r, t_fix)
-    total_cost += sign*p*q
-    payoff += sign*intrinsic(l["Type"], A_grid, l["Strike"])*q
-    if l["Type"] == "Call": call_net += sign*q
-    rows.append({**l.to_dict(), "Eff. avg vol %": 100*eff_vol(v, t_fix, T),
-                 "European premium": black76(l["Type"], spot, l["Strike"], T, v, r),
-                 "Asian unit premium": p, "Cash (+pay/-receive)": sign*p*q})
-pnl = payoff - total_cost
+st.subheader("2) 4-way strike offsets (% of that month's forward) – fixed by you")
+c = st.columns(4)
+k1p = c[0].number_input("Long call strike %", value=100.0, min_value=1.0)
+k2p = c[1].number_input("Short call strike %", value=120.0, min_value=1.0)
+k3p = c[2].number_input("Short put strike %", value=90.0, min_value=1.0)
+k4p = c[3].number_input("Long put strike %", value=80.0, min_value=1.0)
+if not (k4p < k3p < k1p < k2p):
+    st.warning("Expected ordering: long put % < short put % < long call % < short call %.")
 
-def pnl_at(a):
-    v = -total_cost
-    for _, l in legs.iterrows():
-        sign = 1 if l["Direction"] == "Long" else -1
-        v += sign*float(intrinsic(l["Type"], a, l["Strike"]))*l["Qty"]*mult
-    return v
+# ---------------------------------------------------------------- build per-month data
+md = []
+for _, row in months.iterrows():
+    fm = dt.datetime.strptime(row["Month"], "%b %Y").date()
+    start = dt.datetime.strptime(row["Start"], "%Y-%m-%d").date()
+    exp = dt.datetime.strptime(row["Expiry"], "%Y-%m-%d").date()
+    fx = bdays(start, exp); tf = np.array([max((d - today).days, 0)/365.0 for d in fx])
+    Tx = max(tf[-1], 1/365)
+    md.append({"label": row["Month"], "F": float(row["Forward"]), "vol": float(row["Vol %"])/100,
+               "fx": fx, "tf": tf, "T": Tx,
+               "K": [row["Forward"]*k1p/100, row["Forward"]*k2p/100, row["Forward"]*k3p/100, row["Forward"]*k4p/100]})
 
-# ---------------------------------------------------------------- chart 1
-xs, ys = segments(A_grid, pnl)
-fig = go.Figure()
-red_green(fig, xs, ys)
-fig.add_vline(x=spot, line_dash="dot", annotation_text=f"Fwd {spot:g}")
-fig.add_hline(y=0, line_color="black")
-fig.update_layout(title=f"{name} – {tpl} – Asian option P&L vs average price ({fixes[0]:%d %b %Y} to {fixes[-1]:%d %b %Y})",
-                  xaxis_title=f"Average {name} price over averaging period", yaxis_title=f"P&L ({ccy})",
-                  height=480, hovermode="x unified")
-st.plotly_chart(fig, use_container_width=True)
+def month_cost(m, h):
+    F, v, K = m["F"], m["vol"], m["K"]
+    legs = [(1,"Call",K[0]),(-1,"Call",K[1]),(-1,"Put",K[2]),(1,"Put",K[3])]
+    return sum(s*asian_price(k, F, kk, m["T"], v, r, m["tf"])*h*phys_vol*mult for s,k,kk in legs)
 
-up_unl, down_unl = call_net > 1e-12, call_net < -1e-12
-mx = max(pnl.max(), pnl_at(0.0)); mn = min(pnl.min(), pnl_at(0.0))
-be = sorted(set(round(x, 2) for x, y0, y1 in zip(xs[:-1], ys[:-1], ys[1:]) if y0 == 0 and y1 != 0))
-st.subheader("4–6) Option strategy results")
-eur_cost = strategy_cost(None, T, asian=False)
-m = st.columns(5)
-m[0].metric("Net cost (+ pay / – receive)", f"{total_cost:,.2f} {ccy}")
-m[1].metric("Max gain", "Unlimited" if up_unl else f"{mx:,.2f} {ccy}")
-m[2].metric("Max loss", "Unlimited" if down_unl else f"{mn:,.2f} {ccy}")
-m[3].metric("Breakevens (average price)", ", ".join(f"{b:,.2f}" for b in be) or "None")
-m[4].metric("Same strategy, European", f"{eur_cost:,.2f} {ccy}", delta=f"{total_cost-eur_cost:,.2f} (Asian saving)", delta_color="off")
-if down_unl:
-    st.error("Net short calls: loss is unlimited if the average price rises – flag for risk committee.")
-st.dataframe(pd.DataFrame(rows).style.format({"Eff. avg vol %": "{:,.2f}", "European premium": "{:,.4f}",
-             "Asian unit premium": "{:,.4f}", "Cash (+pay/-receive)": "{:,.2f}"}), use_container_width=True)
+def month_pnl(m, h, A):
+    F, K = m["F"], m["K"]
+    legs = [(1,"Call",K[0]),(-1,"Call",K[1]),(-1,"Put",K[2]),(1,"Put",K[3])]
+    p = sum(s*intrinsic(k, A, kk)*h*phys_vol*mult for s,k,kk in legs)
+    return p - month_cost(m, h)
 
-# ---------------------------------------------------------------- cost vs averaging start
-st.subheader("Net cost vs averaging start date (same expiry)")
-cands = {"Today": today, "Tomorrow": today + dt.timedelta(days=1), "+30 days": today + dt.timedelta(days=30),
-         "+60 days": today + dt.timedelta(days=60), "Start of expiry month": first}
-srows = []
-for lab, d0 in cands.items():
-    d0 = min(max(d0, today), expiry)
-    fx, tf = times_for(d0, expiry, today); Tx = max(tf[-1], 1/365)
-    c = strategy_cost(tf, Tx)
-    srows.append({"Averaging start": lab, "Date": d0.strftime("%d %b %Y"), "Fixings": len(fx),
-                  "Net cost": c, "vs European": c - eur_cost})
-st.dataframe(pd.DataFrame(srows).style.format({"Net cost": "{:,.0f}", "vs European": "{:,.0f}"}), use_container_width=True)
-st.caption("Earlier start = longer averaging window = lower effective vol = cheaper long premium (and less premium received on short legs).")
+# ---------------------------------------------------------------- solver
+st.subheader("3) Solver")
+A_grid = np.linspace(0.3*min(m["F"] for m in md), 1.9*max(m["F"] for m in md), 800)
+def evaluate(h):
+    cost = sum(month_cost(m, h) for m in md)
+    net = np.zeros_like(A_grid)
+    for m in md:
+        net += month_pnl(m, h, A_grid)
+    return cost, net.min(), net
 
-# ---------------------------------------------------------------- chart 2
-st.subheader("7) Physical exposure + option strategy = net position")
-sgn = {"Buyer of fuel (cost rises with price)": -1, "Seller / producer (revenue rises with price)": 1, "None": 0}[phys_side]
-phys = sgn*(A_grid - phys_ref)*phys_vol
-net = phys + pnl
+def objective(h):
+    cost, worst, _ = evaluate(h)
+    v_spend = max(0.0, cost - max_spend)
+    v_loss = max(0.0, max_loss - worst)
+    # normalise violations by target scale so both constraints matter
+    scale_s = max(abs(max_spend), 1.0); scale_l = max(abs(max_loss), 1.0)
+    viol = (v_spend/scale_s)**2 + (v_loss/scale_l)**2
+    if viol > 0:
+        return 1e6*viol + cost/scale_s  # nearest feasible: minimise violation, tie-break on cost
+    return cost/scale_s  # feasible: minimise spend
+
+if st.button("Solve 4-way strip", type="primary"):
+    res = differential_evolution(objective, bounds=[(0.0, 3.0)], seed=1, tol=1e-8, polish=True)
+    h = float(res.x[0]); cost, worst, net = evaluate(h)
+    st.session_state["sol"] = (h, cost, worst, net)
+h_sol = st.session_state.get("sol")
+if h_sol:
+    h, cost, worst, net = h_sol
+    feas = cost <= max_spend and worst >= max_loss
+    m = st.columns(5)
+    m[0].metric("Solved hedge ratio", f"{h:.0%} of physical")
+    m[1].metric("Total premium spend", f"{cost:,.0f} {ccy}")
+    m[2].metric("Worst-case net P&L", f"{worst:,.0f} {ccy}")
+    m[3].metric("Max spend target", f"{max_spend:,.0f} {ccy}", delta=f"{cost-max_spend:,.0f}", delta_color="inverse")
+    m[4].metric("Max loss target", f"{max_loss:,.0f} {ccy}", delta=f"{worst-max_loss:,.0f}", delta_color="normal")
+    if feas:
+        st.success("Both targets met. This is the lowest-spend hedge ratio that satisfies them.")
+    else:
+        st.warning("No hedge ratio meets both targets with these strikes. This is the closest solution: "
+                   f"spend over by {max(0,cost-max_spend):,.0f}, loss over by {max(0,max_loss-worst):,.0f}. "
+                   "Widen the strikes or relax a target.")
+else:
+    h, cost, worst, net = hedge_pct, sum(month_cost(m, hedge_pct) for m in md), None, None
+    st.info("Set targets and press 'Solve 4-way strip'. The charts below currently use the slider hedge ratio.")
+
+# ---------------------------------------------------------------- charts
+st.subheader("4) Resulting charts")
+fig1 = go.Figure()
+for m in md:
+    A = np.linspace(m["F"]*0.5, m["F"]*1.5, 400)
+    p = month_pnl(m, h, A)
+    fig1.add_trace(go.Scatter(x=A, y=p, mode="lines", name=m["label"]))
+fig1.add_hline(y=0, line_color="black")
+fig1.update_layout(title="Per-month 4-way P&L vs that month's average price",
+                   xaxis_title="Average price", yaxis_title=f"P&L ({ccy})", height=450, hovermode="x unified")
+st.plotly_chart(fig1, use_container_width=True)
+
+pct = np.linspace(-50, 90, 500)
+agg = np.zeros_like(pct)
+for m in md:
+    A = m["F"]*(1+pct/100)
+    agg += month_pnl(m, h, A)
+xs, ys = segments(1+pct/100, agg)
 fig2 = go.Figure()
-fig2.add_trace(go.Scatter(x=A_grid, y=phys, mode="lines", line=dict(color="rgba(120,120,120,0.6)", width=2, dash="dash"), name="Physical (lowlight)"))
-fig2.add_trace(go.Scatter(x=A_grid, y=pnl, mode="lines", line=dict(color="rgba(70,130,200,0.55)", width=2), name="Asian option strategy (lowlight)"))
-xn, yn = segments(A_grid, net)
-red_green(fig2, xn, yn, lw=4)
-fig2.add_vline(x=spot, line_dash="dot", annotation_text=f"Fwd {spot:g}")
+red_green(fig2, xs, ys, lw=4)
+fig2.add_vline(x=1.0, line_dash="dot", annotation_text="Forward")
 fig2.add_hline(y=0, line_color="black")
-fig2.update_layout(title="Net P&L vs average price (negative = cost increase / loss)",
-                   xaxis_title=f"Average {name} price", yaxis_title=f"P&L ({ccy})", height=520, hovermode="x unified")
+fig2.update_layout(title="Strip total P&L vs % move in each month's average price",
+                   xaxis_title="Price move vs forward (%)", yaxis_title=f"P&L ({ccy})", height=480, hovermode="x unified")
 st.plotly_chart(fig2, use_container_width=True)
 
-nm = st.columns(3)
-nm[0].metric("Net worst case (grid 30%-190% of fwd)", f"{net.min():,.0f} {ccy}")
-nm[1].metric("Net best case (grid)", f"{net.max():,.0f} {ccy}")
-nm[2].metric("Physical-only worst (grid)", f"{phys.min():,.0f} {ccy}")
-sc = []
-for s in [-0.3, -0.2, -0.1, 0, 0.1, 0.2, 0.3]:
-    P = spot*(1+s); ph = sgn*(P-phys_ref)*phys_vol; op = pnl_at(P)
-    sc.append({"Avg price move": f"{s:+.0%}", "Avg price": P, "Physical P&L": ph, "Option P&L": op, "Net P&L": ph+op,
-               "Effective unit price (buyer)": (phys_ref*phys_vol - ph - op)/phys_vol if phys_vol else np.nan})
-st.dataframe(pd.DataFrame(sc).style.format({"Avg price": "{:,.2f}", "Physical P&L": "{:,.0f}", "Option P&L": "{:,.0f}",
-             "Net P&L": "{:,.0f}", "Effective unit price (buyer)": "{:,.2f}"}), use_container_width=True)
-st.caption("Arithmetic daily-average (business days) options, flat forward curve, flat vol, moment-matched lognormal approximation, "
-           "premium discounted from expiry, no transaction costs/basis/margining. Indicative only.")
+phys = sum((m["F"]*(1+pct/100) - phys_ref)*phys_vol for m in md)*-1
+netp = phys + agg
+xn, yn = segments(1+pct/100, netp)
+fig3 = go.Figure()
+fig3.add_trace(go.Scatter(x=1+pct/100, y=phys, mode="lines", line=dict(color="rgba(120,120,120,0.6)", width=2, dash="dash"), name="Physical (lowlight)"))
+fig3.add_trace(go.Scatter(x=1+pct/100, y=agg, mode="lines", line=dict(color="rgba(70,130,200,0.55)", width=2), name="Option strip (lowlight)"))
+red_green(fig3, xn, yn, lw=4)
+fig3.add_vline(x=1.0, line_dash="dot", annotation_text="Forward")
+fig3.add_hline(y=0, line_color="black")
+fig3.update_layout(title="Net P&L: physical + option strip (buyer of fuel)",
+                   xaxis_title="Price move vs forward (%)", yaxis_title=f"P&L ({ccy})", height=500, hovermode="x unified")
+st.plotly_chart(fig3, use_container_width=True)
+
+st.subheader("5) Structure per month")
+srows = []
+for m in md:
+    K = m["K"]; c0 = month_cost(m, h)
+    srows.append({"Month": m["label"], "Forward": m["F"], "Vol %": m["vol"]*100,
+                  "Long call K": K[0], "Short call K": K[1], "Short put K": K[2], "Long put K": K[3],
+                  "Volume": h*phys_vol, "Net premium": c0})
+st.dataframe(pd.DataFrame(srows).style.format({"Forward": "{:,.2f}", "Vol %": "{:,.1f}", "Long call K": "{:,.2f}",
+             "Short call K": "{:,.2f}", "Short put K": "{:,.2f}", "Long put K": "{:,.2f}",
+             "Volume": "{:,.0f}", "Net premium": "{:,.0f}"}), use_container_width=True)
+st.caption("Arithmetic daily-average options, flat forward curve per month, per-month vol, moment-matched lognormal pricing. "
+           "Strikes fixed at user offsets; solver finds hedge ratio closest to meeting spend and loss targets.")
